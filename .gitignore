@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+saved_detection_models/
+saved_response_models/
+*.keras
+*.pt
+*.pkl
+*.csv
+*.jsonl
+mas_ids_*.json
+.DS_Store
+.venv/
+env/
