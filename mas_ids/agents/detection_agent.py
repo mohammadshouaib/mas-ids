@@ -168,14 +168,32 @@ def run_dbscan_traffic_windows(
     out_df["_bucket"] = out_df["timestamp"].dt.floor(window)
     available_feats   = [c for c in feature_cols if c in out_df.columns]
 
+    # Per-bucket DBSCAN is O(n^2). With dense packet-capture data a single 1s
+    # bucket can hold tens of thousands of rows, which makes DBSCAN hang / OOM.
+    # Cap the points clustered per bucket; the rest inherit the bucket's modal
+    # outlier flag. This preserves the outlier signal without the blowup.
+    MAX_BUCKET_POINTS = 2000
+
+    if not available_feats:
+        out_df.drop(columns=["_bucket"], inplace=True)
+        return out_df
+
     for _, bucket in out_df.groupby("_bucket", sort=False):
         if len(bucket) < eff_min:
             continue
-        X_b = bucket[available_feats].apply(
+        sample = bucket
+        if len(bucket) > MAX_BUCKET_POINTS:
+            sample = bucket.sample(MAX_BUCKET_POINTS, random_state=42)
+        X_b = sample[available_feats].apply(
             pd.to_numeric, errors="coerce").fillna(0.0).values
         labels = DBSCAN(eps=eps, min_samples=eff_min).fit_predict(X_b)
-        out_df.loc[bucket.index, "dbscan_label"]    = labels
-        out_df.loc[bucket.index, "traffic_outlier"] = (labels == -1).astype(int)
+        out_df.loc[sample.index, "dbscan_label"]    = labels
+        out_df.loc[sample.index, "traffic_outlier"] = (labels == -1).astype(int)
+        # Rows not sampled in an oversized bucket default to non-outlier (0)
+        if len(bucket) > MAX_BUCKET_POINTS:
+            unsampled = bucket.index.difference(sample.index)
+            out_df.loc[unsampled, "dbscan_label"]    = 0
+            out_df.loc[unsampled, "traffic_outlier"] = 0
 
     out_df.drop(columns=["_bucket"], inplace=True)
     return out_df
