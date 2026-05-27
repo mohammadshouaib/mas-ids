@@ -72,7 +72,14 @@ def shannon_entropy(series: pd.Series) -> float:
 
 def q_thresh(df: pd.DataFrame, col: str, q: float = 0.95,
              label_col: str = 'label', normal_label='normal') -> float:
-    """Quantile threshold calibrated on NORMAL rows only."""
+    """Quantile threshold calibrated on NORMAL rows only.
+
+    Returns 0.0 if the column is absent (e.g. a real dataset that does not
+    populate every schema feature), so callers degrade gracefully instead of
+    raising KeyError.
+    """
+    if col not in df.columns:
+        return 0.0
     if label_col in df.columns:
         mask   = df[label_col] == normal_label
         subset = df[mask] if mask.sum() > 10 else df

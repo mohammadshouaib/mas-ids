@@ -81,8 +81,16 @@ def run_full_mas_pipeline(
             [ec.collect_from_dataframe(rdf[emask].copy()),
              gc.collect_from_dataframe(rdf[gmask].copy())], ignore_index=True))
         cdf   = clr.fit_transform(combined.copy())
-        e_df  = cdf[cdf['collection_point'].isin(['edge','edge_gcc'])].copy()
-        g_df  = cdf[cdf['collection_point'].isin(['gcc', 'edge_gcc'])].copy()
+    # Edge/GCC split — runs for BOTH the synthetic and provided-cleaned_df paths.
+    # If a provided cleaned_df has no collection_point column, treat every row as
+    # available to both tiers (edge_gcc) so neither split is empty.
+    if 'collection_point' not in cdf.columns:
+        cdf['collection_point'] = 'edge_gcc'
+    e_df  = cdf[cdf['collection_point'].isin(['edge','edge_gcc'])].copy()
+    g_df  = cdf[cdf['collection_point'].isin(['gcc', 'edge_gcc'])].copy()
+    # Guard against an empty tier (e.g. a dataset with only network-layer rows)
+    if len(e_df) == 0: e_df = cdf.copy()
+    if len(g_df) == 0: g_df = cdf.copy()
     if preview: print(f'  cleaned_df: {cdf.shape}  Labels: {dict(cdf["label"].value_counts())}')
 
     # ── 2. Feature Engineering ────────────────────────────────────────────────
