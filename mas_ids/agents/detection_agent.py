@@ -22,13 +22,13 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import (
+from keras.models import Sequential, Model, load_model
+from keras.layers import (
     Input, Conv1D, MaxPooling1D, LSTM, GRU, Dense,
     Dropout, BatchNormalization, RepeatVector, TimeDistributed, Flatten
 )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import classification_report
 
