@@ -22,13 +22,13 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 import tensorflow as tf
-from keras.models import Sequential, Model, load_model
-from keras.layers import (
+from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.layers import (
     Input, Conv1D, MaxPooling1D, LSTM, GRU, Dense,
     Dropout, BatchNormalization, RepeatVector, TimeDistributed, Flatten
 )
-from keras.optimizers import Adam
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import classification_report
 
@@ -678,16 +678,23 @@ def apply_final_detection_logic(
         0.10 * coord_flood_term
     ).clip(0, 1)
 
-    # Hybrid risk: cross-layer + both classifiers agree
-    # FIX: same ternary precedence bug as dos_risk
+    # Hybrid risk: a TRUE hybrid attack needs genuine cross-layer evidence, not
+    # merely "both other risks are moderate". The previous weighting gave 0.20 to
+    # the (jam>0.3 & dos>0.3) shortcut and 0.35 to a hybrid classifier that had
+    # collapsed (flatlined at 0.8169 due to the scaling bug), so hybrid_risk hit
+    # >=0.60 whenever both branches were mildly active — producing tens of thousands
+    # of HYBRID predictions that were ALL false positives. We now require the cross-
+    # layer signal to carry most of the weight and demote the co-activation shortcut
+    # to a small tie-breaker.
+    # FIX: ternary precedence (same as dos_risk) — extract optional term to a var.
     cl_attack_term = (col("cross_layer_attack_flag")
                       if "cross_layer_attack_flag" in df.columns
                       else pd.Series(0.0, index=df.index))
     hybrid_risk = (
         0.35 * col("hybrid_conf_attack").clip(0,1) +
-        0.25 * (col("cross_layer_anomaly_score") > cl_score_thr).astype(float) +
-        0.20 * cl_attack_term +
-        0.20 * ((jam_risk > 0.3) & (dos_risk > 0.3)).astype(float)
+        0.30 * (col("cross_layer_anomaly_score") > cl_score_thr).astype(float) +
+        0.25 * cl_attack_term +
+        0.10 * ((jam_risk > 0.3) & (dos_risk > 0.3)).astype(float)
     ).clip(0, 1)
 
     # ── Fusion confidence (mirrors gps_risk + routing_risk fusion) ────────────
@@ -702,13 +709,49 @@ def apply_final_detection_logic(
     df["fusion_confidence"] = fusion_conf.round(4)
 
     # ── Final label assignment (mirrors np.select conditions) ─────────────────
-    # DDoS discriminator: many sources + high entropy
-    high_src = col("unique_source_count") > nthr("unique_source_count", 0.99)
-    high_ent = col("src_ip_entropy")      > nthr("src_ip_entropy",      0.95)
-    is_ddos  = high_src & high_ent
+    # DDoS discriminator: a distributed flood shows MANY distinct sources and/or a
+    # HIGH source-IP entropy (many addresses ⇒ high entropy).
+    #
+    # BUG FIX: the previous discriminator was
+    #     is_ddos = (unique_source_count > 99th pct) & (src_ip_entropy > 95th pct)
+    # ANDing two independent extreme-tail conditions makes the slice vanishingly
+    # thin, and if unique_source_count is degenerate (e.g. single-node capture, where
+    # it was ~constant with MI≈0.018) its 99th pct == its max, so the '>' is never
+    # true and the DDoS branch becomes structurally UNREACHABLE — exactly why DDoS
+    # was predicted 0 times. We now (a) OR the two signals, (b) use slightly looser
+    # quantiles, and (c) ignore a feature entirely if it has no spread among normals,
+    # so a flat column can't silently disable the branch.
+    def _has_spread(c):
+        if c not in df.columns:
+            return False
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        return len(s) > 0 and float(s.std()) > 1e-9
+
+    src_signal = pd.Series(False, index=df.index)
+    if _has_spread("unique_source_count"):
+        src_signal = col("unique_source_count") > nthr("unique_source_count", 0.95)
+    ent_signal = pd.Series(False, index=df.index)
+    if _has_spread("src_ip_entropy"):
+        ent_signal = col("src_ip_entropy") > nthr("src_ip_entropy", 0.90)
+
+    # If neither source feature carries signal in this dataset, distinguish DDoS
+    # from DoS by flood magnitude instead (a very high packet rate with broad
+    # traffic-outlier evidence is treated as distributed).
+    if not (_has_spread("unique_source_count") or _has_spread("src_ip_entropy")):
+        is_ddos = col("traffic_outlier") >= 0.5
+    else:
+        is_ddos = src_signal | ent_signal
+
+    # Hybrid also requires actual cross-layer evidence present (anomaly score over
+    # its normal threshold OR the cross-layer attack flag set), so a saturated/near-
+    # constant hybrid classifier can no longer trigger HYBRID on its own.
+    cl_evidence = (
+        (col("cross_layer_anomaly_score") > cl_score_thr) |
+        (cl_attack_term >= 0.5)
+    )
 
     conditions = [
-        (hybrid_risk >= 0.60) & (jam_risk >= 0.30) & (dos_risk >= 0.30),  # Hybrid
+        (hybrid_risk >= 0.60) & (jam_risk >= 0.30) & (dos_risk >= 0.30) & cl_evidence,  # Hybrid
         (jam_risk >= 0.60),                                                 # Strong jamming
         (dos_risk >= 0.60) & is_ddos,                                       # DDoS
         (dos_risk >= 0.60) & ~is_ddos,                                      # DoS

@@ -126,8 +126,26 @@ def run_full_mas_pipeline(
     hf   = list(set(jf+df+xf))
     proc = safe_numeric_fill(adf, hf)
     sj   = fit_scaler_on_normal(proc, jf); sd = fit_scaler_on_normal(proc, df)
-    sh   = fit_scaler_on_normal(proc, hf)
-    fdf  = apply_scaler(apply_scaler(apply_scaler(proc, jf, sj), df, sd), hf, sh)
+    # Cross-layer-only features (in the hybrid set but not in jam or dos) get their
+    # own scaler so every column is scaled exactly ONCE.
+    xf_only = [c for c in xf if c not in jf and c not in df]
+    sx   = fit_scaler_on_normal(proc, xf_only) if xf_only else None
+    # BUG FIX (double-scaling): the previous code did
+    #     fdf = apply_scaler(apply_scaler(apply_scaler(proc, jf, sj), df, sd), hf, sh)
+    # Since hf == set(jf+df+xf), the third pass re-scaled the ALREADY-scaled
+    # jam/DoS columns with a scaler fit on RAW values. Double-scaling collapsed the
+    # dynamic range (a DoS flood and a normal window ended up ~0.13 apart instead of
+    # cleanly separated) — the reason the DoS/hybrid CNN+LSTM flatlined at 0.8169
+    # and the DoS AE/GRU losses exploded to ~1e8.
+    #
+    # Now each column is scaled once with its own branch scaler. Because the hybrid
+    # feature set is the union of these same columns, the hybrid sequences are built
+    # from the SAME consistently-scaled frame — so training and inference (which
+    # both read fdf) match exactly.
+    fdf  = apply_scaler(apply_scaler(proc, jf, sj), df, sd)
+    if sx is not None:
+        fdf = apply_scaler(fdf, xf_only, sx)
+    sh   = None  # retained key below for backward-compat of fe_state
     Xj,yj,_ = create_sequences(fdf, jf, SEQ_LEN)
     Xd,yd,_ = create_sequences(fdf, df, SEQ_LEN)
     Xh,yh,_ = create_sequences(fdf, hf, SEQ_LEN)
@@ -140,7 +158,7 @@ def run_full_mas_pipeline(
     Xhtr,yhtr = balance_sequences(Xhtr,yhtr,LABEL_MAP,0.40)
     _fe = {'JAM_FEAT_FINAL':jf,'DOS_FEAT_FINAL':df,'CROSS_FEATS':xf,
            'HYBRID_FEAT_FINAL':hf,'scaler_jam':sj,'scaler_dos':sd,
-           'scaler_hybrid':sh,'seq_len':SEQ_LEN,'label_map':LABEL_MAP}
+           'scaler_cross':sx,'seq_len':SEQ_LEN,'label_map':LABEL_MAP}
     if preview: print(f'  JAM:{len(jf)} DoS:{len(df)} Hybrid:{len(hf)} features')
 
     # ── 3. Detection ──────────────────────────────────────────────────────────
