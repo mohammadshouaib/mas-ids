@@ -1162,3 +1162,5 @@ def coordinate_single(detection_input: dict, preview: bool = True) -> dict:
               f"RATE LIMIT: {output['rate_limit_aggressiveness']}")
         print("=" * 62)
     return output
+
+

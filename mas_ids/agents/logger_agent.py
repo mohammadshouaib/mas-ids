@@ -313,7 +313,11 @@ class LoggerAgent:
 
     # ── Core log_event (mirrors original exactly) ──────────────────────────────
     def log_event(self, record: dict) -> dict:
-        record = deepcopy(record)
+        # Shallow copy is sufficient here: callers pass freshly-built dicts and
+        # this method only assigns NEW top-level keys (event_id, log_hash, ...);
+        # it never mutates the nested summary dicts. A deepcopy per event across
+        # 200k+ records is a large, needless memory/CPU cost (OOM contributor).
+        record = dict(record)
         record["event_id"]      = self._safe_str(record.get("event_id", str(uuid.uuid4())))
         record["correlation_id"]= self._safe_str(record.get("correlation_id", record["event_id"]))
         record["log_timestamp"] = self.utc_now_iso()
@@ -518,10 +522,27 @@ class LoggerAgent:
     # ── Save logs (mirrors original exactly) ───────────────────────────────────
     def save_logs(self, prefix: str = "logger_agent") -> dict:
         self.flush_batch_if_needed(force=True)
-        logs_df   = pd.DataFrame(self.logs)
+
+        # Write the logs CSV in chunks so we never materialise a second full
+        # copy of all 200k+ nested records as one giant DataFrame (OOM source).
+        logs_csv = f"{prefix}_logs.csv"
+        CHUNK = 20_000
+        if self.logs:
+            header_written = False
+            for start in range(0, len(self.logs), CHUNK):
+                chunk_df = pd.DataFrame(self.logs[start:start + CHUNK])
+                chunk_df.to_csv(logs_csv, index=False,
+                                mode="w" if not header_written else "a",
+                                header=not header_written)
+                header_written = True
+                del chunk_df
+        else:
+            pd.DataFrame(self.logs).to_csv(logs_csv, index=False)
+
         merkle_df = pd.DataFrame(self.merkle_batches)
-        logs_df.to_csv(   f"{prefix}_logs.csv",            index=False)
-        merkle_df.to_csv( f"{prefix}_merkle_batches.csv",  index=False)
+        merkle_df.to_csv(f"{prefix}_merkle_batches.csv", index=False)
+
+        # Stream JSONL straight from the list (no extra in-memory copy).
         with open(f"{prefix}_logs.jsonl",   "w", encoding="utf-8") as f:
             for log in self.logs:
                 f.write(json.dumps(log, default=str) + "\n")
@@ -530,7 +551,7 @@ class LoggerAgent:
                 f.write(json.dumps(batch, default=str) + "\n")
         print(f"Logs saved — {len(self.logs)} events | {len(self.merkle_batches)} Merkle batches.")
         return {
-            "logs_csv"      : f"{prefix}_logs.csv",
+            "logs_csv"      : logs_csv,
             "logs_jsonl"    : f"{prefix}_logs.jsonl",
             "merkle_csv"    : f"{prefix}_merkle_batches.csv",
             "merkle_jsonl"  : f"{prefix}_merkle_batches.jsonl",
@@ -619,22 +640,39 @@ def run_logger_agent(
     phy_sketch    = PhysicalLayerSketch()
     ddos_bloom    = BloomFilter(capacity=10_000, error_rate=0.01)
 
-    # ── Align detection and response on (timestamp, node_id) ──────────────────
-    det  = detection_df.copy()
-    resp = response_df.copy()
-    det["timestamp"]  = pd.to_datetime(det["timestamp"],  errors="coerce")
-    resp["timestamp"] = pd.to_datetime(resp["timestamp"], errors="coerce")
+    # ── Align detection and response ROW-WISE ────────────────────────────────
+    # detection_df and response_df are row-parallel (response is produced from
+    # detection, row i <-> row i). Merging on ["timestamp","node_id"] is a
+    # many-to-many join here: a single node and repeating 1-second timestamps
+    # make those keys non-unique, so pandas emits the Cartesian product and
+    # blows ~200k rows up into millions (Kaggle OOM). Use positional alignment.
+    det  = detection_df.reset_index(drop=True)
+    det  = det.assign(timestamp=pd.to_datetime(det["timestamp"], errors="coerce"))
+    resp = response_df.reset_index(drop=True)
 
-    shared = ["timestamp","node_id"]
-    shared = [c for c in shared if c in det.columns and c in resp.columns]
-    merged = det.merge(resp, on=shared, how="left",
-                       suffixes=("","_resp")).sort_values("timestamp")\
-                .reset_index(drop=True)
+    if len(resp) == len(det):
+        new_cols = [c for c in resp.columns if c not in det.columns]
+        clash    = [c for c in resp.columns
+                    if c in det.columns and c not in ("timestamp", "node_id")]
+        add = resp[new_cols]
+        if clash:
+            add = pd.concat([add, resp[clash].add_suffix("_resp")], axis=1)
+        merged = pd.concat([det, add], axis=1)
+    else:
+        # Length mismatch (not expected in-pipeline): 1:1 merge on a row id.
+        det = det.assign(_row_id=np.arange(len(det)))
+        resp = resp.assign(_row_id=np.arange(len(resp)))
+        keep = [c for c in resp.columns if c not in det.columns or c == "_row_id"]
+        merged = det.merge(resp[keep], on="_row_id", how="left",
+                           suffixes=("", "_resp")).drop(columns="_row_id")
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+    del det, resp
 
     n = len(merged)
     print(f"[Logger] Replaying {n} detection+response rows...")
 
-    for i, (_, row) in enumerate(merged.iterrows(), start=1):
+    for i, row in enumerate(
+            (r._asdict() for r in merged.itertuples(index=False)), start=1):
         node_id    = str(row.get("node_id",   "unknown"))
         node_type  = str(row.get("node_type", "uav"))
         label      = str(row.get("final_label","NORMAL"))
@@ -708,12 +746,12 @@ def run_logger_agent(
             print(f"  [UAV/UGV] Processed {i}/{n} rows")
 
     # ── Coordination events ────────────────────────────────────────────────────
-    coord = coordination_df.copy()
-    coord["timestamp"] = pd.to_datetime(coord["timestamp"], errors="coerce")
+    coord = coordination_df.assign(
+        timestamp=pd.to_datetime(coordination_df["timestamp"], errors="coerce"))
     coord = coord.dropna(subset=["timestamp"]).sort_values("timestamp")
     print(f"[Logger] Replaying {len(coord)} coordination rows...")
 
-    for _, row in coord.iterrows():
+    for row in (r._asdict() for r in coord.itertuples(index=False)):
         logger.log_edge_event(
             edge_id                        = "edge_1",
             final_label                    = str(row.get("final_label","NORMAL")),
