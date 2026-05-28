@@ -290,31 +290,58 @@ class CoordinationAgent:
         Mirrors CoordinationAgent.coordinate() from the original exactly.
         Returns a list of coordination log dicts.
         """
-        det  = detection_df.copy()
-        resp = response_df.copy()
-        det["timestamp"]  = pd.to_datetime(det["timestamp"],  errors="coerce")
-        resp["timestamp"] = pd.to_datetime(resp["timestamp"], errors="coerce")
-        det  = det.dropna(subset=["timestamp"])
-        resp = resp.dropna(subset=["timestamp"])
+        # NOTE: detection_df and response_df are ROW-PARALLEL — response_df is
+        # produced by run_response_agent_inference(detection_df, ...), so row i
+        # of one corresponds to row i of the other. The previous implementation
+        # merged on ["timestamp","node_id","final_label","severity"], but those
+        # columns are NOT unique (1-second windows repeat, often a single node,
+        # only a few distinct labels/severities). pandas then emits the Cartesian
+        # product of every colliding key group — a many-to-many blow-up that turns
+        # ~200k rows into tens of millions and exhausts RAM (Kaggle OOM).
+        #
+        # The correct alignment is positional. We concat the response-only
+        # columns onto detection by row index (cheap, exactly len(det) rows),
+        # avoiding both the copies and the explosion.
+        det = detection_df.reset_index(drop=True)
+        det = det.assign(timestamp=pd.to_datetime(det["timestamp"], errors="coerce"))
 
-        # Merge on shared key columns
-        shared_keys = ["timestamp","node_id","final_label","severity"]
-        shared_keys = [c for c in shared_keys
-                       if c in det.columns and c in resp.columns]
-        merged = det.merge(
-            resp, on=shared_keys,
-            how="left", suffixes=("","_resp")
-        ).sort_values(["timestamp","node_id"]).reset_index(drop=True)
+        # Bring over only the response columns not already in detection, suffixing
+        # any genuine name clashes with "_resp" to preserve the old row schema.
+        resp = response_df.reset_index(drop=True)
+        if len(resp) != len(det):
+            # Lengths differ (shouldn't happen in the pipeline) — fall back to a
+            # 1:1 merge on a stable row id rather than the non-unique columns.
+            det["_row_id"]  = np.arange(len(det))
+            resp = resp.copy(); resp["_row_id"] = np.arange(len(resp))
+            new_cols = [c for c in resp.columns
+                        if c not in det.columns or c == "_row_id"]
+            merged = det.merge(resp[new_cols], on="_row_id", how="left",
+                               suffixes=("", "_resp")).drop(columns="_row_id")
+        else:
+            new_cols = [c for c in resp.columns if c not in det.columns]
+            clash    = [c for c in resp.columns
+                        if c in det.columns and c not in
+                        ("timestamp", "node_id", "final_label", "severity")]
+            add = resp[new_cols]
+            if clash:
+                add = pd.concat(
+                    [add, resp[clash].add_suffix("_resp")], axis=1)
+            merged = pd.concat([det, add], axis=1)
+
+        merged = merged.dropna(subset=["timestamp"])
+        merged = merged.sort_values(["timestamp", "node_id"]).reset_index(drop=True)
+        del det, resp
 
         logs   = []
         window = []   # rolling 10-row window for coordinated-attack detection
 
-        for _, row in merged.iterrows():
+        for row in merged.itertuples(index=False):
+            row = dict(row._asdict())
             node_id      = str(row.get("node_id", "unknown"))
             node_type    = self._node_type(row)
             trust_before = self.trust_model.score(node_id)
 
-            pos_ev, neg_ev, ev_score = self.build_trust_evidence(row.to_dict())
+            pos_ev, neg_ev, ev_score = self.build_trust_evidence(row)
             trust_after  = self.trust_model.update(node_id, pos_ev, neg_ev)
             status       = self.derive_status(str(row.get("final_label","NORMAL")),
                                                trust_after)
@@ -800,13 +827,27 @@ class ManagementAgent:
           6. Generate and log swarm directive
         Returns list of directive dicts.
         """
-        det  = detection_df.copy()
-        resp = response_df.copy()
-        cord = coord_df.copy()
+        # Avoid full-frame .copy() of three ~200k×150 DataFrames held at once
+        # (hundreds of MB each -> OOM risk). We only need a datetime timestamp
+        # column and positional slicing, so reference the frames directly and
+        # convert timestamps without mutating the callers.
+        det  = detection_df
+        resp = response_df
+        cord = coord_df
 
-        det["timestamp"]  = pd.to_datetime(det["timestamp"],  errors="coerce")
-        resp["timestamp"] = pd.to_datetime(resp["timestamp"], errors="coerce")
-        cord["timestamp"] = pd.to_datetime(cord["timestamp"], errors="coerce")
+        def _with_ts(df):
+            if "timestamp" not in df.columns:
+                return df
+            ts = pd.to_datetime(df["timestamp"], errors="coerce")
+            if ts.equals(df["timestamp"]):
+                return df
+            # assign returns a shallow copy sharing the other columns' blocks,
+            # far cheaper than df.copy().
+            return df.assign(timestamp=ts)
+
+        det  = _with_ts(det)
+        resp = _with_ts(resp)
+        cord = _with_ts(cord)
 
         n = len(det)
         directives = []
@@ -1121,5 +1162,3 @@ def coordinate_single(detection_input: dict, preview: bool = True) -> dict:
               f"RATE LIMIT: {output['rate_limit_aggressiveness']}")
         print("=" * 62)
     return output
-
-
