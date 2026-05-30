@@ -808,8 +808,8 @@ def apply_final_detection_logic(
         "HIGH_CROSS_LAYER_SCORE"    : col("cross_layer_anomaly_score") > cl_score_thr,
         "SWARM_CONSENSUS_ANOMALY"   : col("swarm_consensus_anomaly_score") > swarm_thr,
         "COORDINATED_FLOOD"         : col("coordinated_flood_flag") == 1,
-        "HIGH_SRC_ENTROPY"          : high_ent,
-        "HIGH_SOURCE_COUNT"         : high_src,
+        "HIGH_SRC_ENTROPY"          : ent_signal,
+        "HIGH_SOURCE_COUNT"         : src_signal,
         "NOISE_FLOOR_ELEVATED"      : col("noise_floor_drift_flag") == 1,
         "PHYSICAL_IMPOSSIBILITY"    : (col("bit_error_rate") > 0.30) & (col("snr_db") < 0),
     }
@@ -1066,5 +1066,3 @@ def predict_single(input_data: dict, det_models: dict, fe_state: dict,
 
 
 # ── Five canonical test cases ─────────────────────────────────────────────────
-
-
