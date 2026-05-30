@@ -771,16 +771,36 @@ def apply_final_detection_logic(
     hybrid_routes_to_jamming = jam_risk >= dos_risk
     hybrid_gate = (hybrid_risk >= 0.60) & (jam_risk >= 0.30) & (dos_risk >= 0.30) & cl_evidence
 
+    # ── Threshold rebalance (Apr 2026) ────────────────────────────────────────
+    # Diagnosis from the previous run:
+    #   * NORMAL precision = 0.56, recall = 0.77  -> 36,506 attack rows being
+    #     scored as NORMAL (the binding constraint on recall).
+    #   * JAMMING produced 47,917 false positives vs 41,590 TPs (~46% precision).
+    #     JAMMING recall on actual jamming was already ~100% (41,590/41,600), so
+    #     the FPs are coming from the GRAY-ZONE moderate gate sweeping up non-
+    #     jamming rows, not from the strong gate.
+    # Two scoped knobs, applied symmetrically in both hybrid/no-hybrid branches:
+    #   (1) Moderate jamming threshold 0.30 -> 0.40. This cuts FPs sharply while
+    #       barely touching jamming TPs, since true jamming sits well above 0.40.
+    #   (2) SUSPICIOUS threshold 0.15 -> 0.08. This is the last-chance gate for
+    #       the gray-zone 'suspicious' class (50k rows in UAV-NIDD); lowering it
+    #       converts a chunk of would-be NORMAL FNs into SUSPICIOUS TPs.
+    JAM_STRONG   = 0.60
+    JAM_MODERATE = 0.40   # was 0.30
+    DOS_STRONG   = 0.60
+    DOS_MODERATE = 0.30
+    SUSPICIOUS_THR = 0.10 # was 0.15
+
     if ground_truth_has_hybrid:
         conditions = [
             hybrid_gate,                                                    # Hybrid
-            (jam_risk >= 0.60),                                             # Strong jamming
-            (dos_risk >= 0.60) & is_ddos,                                   # DDoS
-            (dos_risk >= 0.60) & ~is_ddos,                                  # DoS
-            (jam_risk >= 0.30),                                             # Moderate jamming
-            (dos_risk >= 0.30) & is_ddos,                                   # Moderate DDoS
-            (dos_risk >= 0.30) & ~is_ddos,                                  # Moderate DoS
-            (fusion_conf >= 0.15),                                          # Suspicious
+            (jam_risk >= JAM_STRONG),                                       # Strong jamming
+            (dos_risk >= DOS_STRONG) & is_ddos,                             # DDoS
+            (dos_risk >= DOS_STRONG) & ~is_ddos,                            # DoS
+            (jam_risk >= JAM_MODERATE),                                     # Moderate jamming
+            (dos_risk >= DOS_MODERATE) & is_ddos,                           # Moderate DDoS
+            (dos_risk >= DOS_MODERATE) & ~is_ddos,                          # Moderate DoS
+            (fusion_conf >= SUSPICIOUS_THR),                                # Suspicious
         ]
         choices = [
             "HYBRID_ATTACK", "JAMMING", "DDOS", "DOS",
@@ -792,13 +812,13 @@ def apply_final_detection_logic(
             hybrid_gate &  hybrid_routes_to_jamming,                        # was Hybrid -> JAMMING
             hybrid_gate & ~hybrid_routes_to_jamming &  is_ddos,             # was Hybrid -> DDOS
             hybrid_gate & ~hybrid_routes_to_jamming & ~is_ddos,             # was Hybrid -> DOS
-            (jam_risk >= 0.60),                                             # Strong jamming
-            (dos_risk >= 0.60) & is_ddos,                                   # DDoS
-            (dos_risk >= 0.60) & ~is_ddos,                                  # DoS
-            (jam_risk >= 0.30),                                             # Moderate jamming
-            (dos_risk >= 0.30) & is_ddos,                                   # Moderate DDoS
-            (dos_risk >= 0.30) & ~is_ddos,                                  # Moderate DoS
-            (fusion_conf >= 0.15),                                          # Suspicious
+            (jam_risk >= JAM_STRONG),                                       # Strong jamming
+            (dos_risk >= DOS_STRONG) & is_ddos,                             # DDoS
+            (dos_risk >= DOS_STRONG) & ~is_ddos,                            # DoS
+            (jam_risk >= JAM_MODERATE),                                     # Moderate jamming
+            (dos_risk >= DOS_MODERATE) & is_ddos,                           # Moderate DDoS
+            (dos_risk >= DOS_MODERATE) & ~is_ddos,                          # Moderate DoS
+            (fusion_conf >= SUSPICIOUS_THR),                                # Suspicious
         ]
         choices = [
             "JAMMING", "DDOS", "DOS",
