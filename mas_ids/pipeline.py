@@ -93,6 +93,29 @@ def run_full_mas_pipeline(
     if len(g_df) == 0: g_df = cdf.copy()
     if preview: print(f'  cleaned_df: {cdf.shape}  Labels: {dict(cdf["label"].value_counts())}')
 
+    # ── ID-column inspection (diagnostic only) ────────────────────────────────
+    # Surfaces any column that could be used to identify a node/source/host.
+    # Helps diagnose the "DBSCAN: 1 node(s)" collapse — if a real identifier is
+    # in the data but isn't being routed to swarm/coordination, this print will
+    # make it obvious. Purely informational; does not change pipeline behaviour.
+    if preview:
+        print('  [diag] columns:', cdf.columns.tolist())
+        id_keys = ('node', 'id', 'src', 'dst', 'mac', 'ip',
+                   'device', 'host', 'addr')
+        id_cols = [c for c in cdf.columns
+                   if any(k in c.lower() for k in id_keys)]
+        if id_cols:
+            print('  [diag] id-like columns (name, n_unique, sample):')
+            for c in id_cols:
+                try:
+                    n = cdf[c].nunique(dropna=True)
+                    samp = cdf[c].dropna().iloc[0] if cdf[c].notna().any() else 'NA'
+                    print(f'    {c:30s} n_unique={n:<8} sample={samp!r}')
+                except Exception as ex:
+                    print(f'    {c:30s} <unreadable: {ex}>')
+        else:
+            print('  [diag] no id-like columns found')
+
     # ── 2. Feature Engineering ────────────────────────────────────────────────
     if preview: print('\n=== Agent 2: Feature Engineering ===')
     _jb = TemporalJammingFeatureBuilder(); _db = TemporalDoSFeatureBuilder()
@@ -231,5 +254,3 @@ def run_full_mas_pipeline(
         'det_models'   : _tr,
         'response_policy': _tp,
     }
-
-
